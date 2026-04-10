@@ -84,7 +84,6 @@ def maybe_initialize_model(model, args, device: torch.device) -> None:
         )
 
 def build_criteria(task: str) -> Dict[str, nn.Module]:
-    # Label smoothing prevents catastrophic overfitting from scratch
     cls_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
     if task == "classification": return {"classification": cls_loss}
     if task == "localization": return {"localization": IoULoss()}
@@ -117,7 +116,6 @@ def compute_losses(outputs, batch, criteria, task):
     metrics["dice"] = dice_score(outputs["segmentation"].detach(), batch["segmentation_mask"]).item()
     return loss, metrics
 
-# FIX: Added scheduler as an optional parameter
 def train_or_eval_epoch(model, loader, optimizer, criteria, device, task, train, scheduler=None):
     model.train() if train else model.eval()
     running, all_targets, all_preds = {}, [], []
@@ -135,8 +133,6 @@ def train_or_eval_epoch(model, loader, optimizer, criteria, device, task, train,
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                
-                # FIX: OneCycleLR must be stepped AFTER EVERY BATCH during training
                 if scheduler is not None:
                     scheduler.step()
 
@@ -162,39 +158,49 @@ def main():
     parser.add_argument("--data-root", default=r"D:\oxford-iiit-pet")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch-size", type=int, default=16) # Added for configurability
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--dropout", type=float, default=0.5)
-    parser.add_argument("--checkpoint-path", default=r"D:\checkpoints\vgg11_best.pth")
+    parser.add_argument("--checkpoint-path", default=r"checkpoints\vgg11_best.pth")
     parser.add_argument("--encoder-checkpoint", type=str, help="Path to VGG11 classification weights")
     parser.add_argument("--classifier-checkpoint", type=str)
     parser.add_argument("--localizer-checkpoint", type=str)
-    parser.add_argument("--segmentation_checkpoint", type=str)
+    parser.add_argument("--segmentation-checkpoint", type=str)
     parser.add_argument("--init-from", type=str, help="Resume full model from checkpoint")
     parser.add_argument("--freeze-encoder", action="store_true", help="Freeze VGG11 weights")
     parser.add_argument("--disable-batchnorm", action="store_true")
+    # New argument for evaluation mode
+    parser.add_argument("--eval-only", action="store_true", help="Run only the evaluation loop")
     args = parser.parse_args()
 
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
+    # Load data
     train_ds = OxfordIIITPetDataset(root=args.data_root, split="train")
     val_ds = OxfordIIITPetDataset(root=args.data_root, split="val")
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
+    # Initialize model and criteria
     model = build_model(args).to(device)
     maybe_initialize_model(model, args, device)
     criteria = build_criteria(args.task)
-    
-    # Restored AdamW with aggressive L2 penalty (weight_decay)
+
+    # Handle evaluation mode
+    if args.eval_only:
+        print(f"\nRunning evaluation on {args.task} task...")
+        val_m = train_or_eval_epoch(model, val_loader, None, criteria, device, args.task, False)
+        print(f"Validation results: {val_m}")
+        return
+
+    # Regular training loop
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=1e-2)
-    
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=args.lr, # Peak LR (e.g., 1e-3)
+        max_lr=args.lr,
         steps_per_epoch=len(train_loader),
         epochs=args.epochs,
-        pct_start=0.3 # Peaks at 30% of training, then decays
+        pct_start=0.3
     )
 
     wandb = get_wandb()
@@ -203,10 +209,7 @@ def main():
     best_val_loss = float("inf")
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch} | Current LR: {optimizer.param_groups[0]['lr']:.6f}")
-        
-        # FIX: Pass scheduler into the train function so it steps per-batch
         train_m = train_or_eval_epoch(model, train_loader, optimizer, criteria, device, args.task, True, scheduler=scheduler)
-        
         val_m = train_or_eval_epoch(model, val_loader, optimizer, criteria, device, args.task, False)
         
         if val_m["loss"] < best_val_loss:
